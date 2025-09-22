@@ -22,7 +22,7 @@ def Delete_Old_Files(folder):
             os.remove(filename)
             print(f'Deleted {filename}')
             
-
+#Data validation for all 6 oneroster files. Files are then written to a new folder for cleanliness
 def Fix_Headers(folder_path):
     for filename in folder_path.glob('*.csv'):
         dual_students = {'list of dual enrolled students'}
