@@ -1,171 +1,171 @@
-import paramiko
+# Imports
+# Config
+import config
+# Import Built in Modules
 import os
-import zipfile
-import time
-import pandas as pd
-import sys
 import logging
-from datetime import datetime
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
-logging.basicConfig(level=logging.DEBUG)
+# Third Party Imports
+import paramiko
+import pandas as pd
+import zipfile
+import polars as pl
 
-Log_File = 'Path to log file'
-sys.stdout = open(Log_File, 'a')
-sys.stderr = sys.stdout
-print(f'\nStarting ASMUpload.py at {datetime.now()}\n\n')
+# Create the logger object #
+logger = logging.getLogger('ASM Upload Log')
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')
+handler = TimedRotatingFileHandler(config.log_path, when='D', interval=30, backupCount=12)
+handler.setFormatter(formatter)
+logger.addHandler(handler)
 
-#Q Exports overwrite existing and append the time to them, runs at 10pm so 22 is in the filename of old ones
-def Delete_Old_Files(folder):
-    for filename in folder.glob('*.csv'):
-        if '22' in filename.name: #Update to your time, or other identifier 22 was easiest for us
-            os.remove(filename)
-            print(f'Deleted {filename}')
+# Delete the old Qmlativ exported files each run. (22 is appended in filename for old files since export runs at 9pm every night)
+def delete_old_files():
+    for file in Path(config.source_folder).glob( '*22*.csv'):
+        try:
+            os.remove(file)
+            logger.info(f'Deleted {file.name}')
+        # don't raise it really doesn't matter if these files are deleted. The upload is what matters.
+        except Exception as e:
+            logger.error(f'Could not delete files: {e}\n')
+
+# process the students file and write to new location
+def students_file(file):
+    df = pd.read_csv(file) # left as pandas since its small granular changes
+    # Some students are dual enrolled at elem and IMS. Look for the duplicate - check which one is the IMS record and delete that row (for now)
+    drop_list = df.index[df['person_id'].isin(config.dual) & (df['location_id'] == 222) ]
+    df = df.drop(drop_list)
+    # Correct a student's name that is jacked up because of an accent above the e. Shout out computers.
+    name_row = df.index[df['person_id']==71340]
+    df.loc[name_row, 'first_name'] = 'Maelys'
+    name_row = df.index[df['person_id'] == 66769]
+    df.loc[name_row, 'last_name'] = 'Arevalo'
+
+    df.to_csv(config.students_file, index=False)
+
+
+# process staff file and write to new locaiton
+def staff_file(file):
+    df = pl.read_csv(file, null_values=[""])
+
+    df = df.with_columns(pl.lit(None).alias('middle_name'))
+    df = df.filter(pl.col('middle_initial').is_not_null())
+    df = df.select('person_id', 'person_number', 'first_name','middle_name', 'last_name', 'email_address', 'sis_username', 'middle_initial','location_id 1')
+
+    df.columns = config.staff
+    df.write_csv(config.staff_file, separator=",")
+
+
+# function for processing files that do not require any changes other than updating headers 
+def other_files(file):
+    df = pl.read_csv(file)
+    df.columns = config.file_keys.get(file.name)[0]
+    df.write_csv((config.file_keys.get(file.name)[1]), separator=",")
+
+
+# function for processing the classes.csv file
+def class_file(file):
+    instructor_3_path = Path(config.source_folder) / 'instructor3-template.csv'
+
+    # read in classes csv and cast columns as needed
+    classes_df = (
+        pl.read_csv(file, null_values=[""])
+        .with_columns([
+            pl.col('location_id').cast(pl.Utf8),
+            pl.col('class_id').cast(pl.Int64),
+            pl.col('instructor_id2').cast(pl.Int64),
+        ])
+    )
+    # read in instructor3-template and read in instructor3/4 columns as dfs
+    instructor_3_df = pl.read_csv(
+        instructor_3_path,
+        columns=[0, 1]
+    ).with_columns(pl.col('class_id').cast(pl.Int64))
+
+    instructor_4_df = pl.read_csv(
+        instructor_3_path,
+        columns=[0, 2]
+    ).with_columns(pl.col('class_id').cast(pl.Int64))
+
+    # Join instructor columns to classes df
+    result_df = (
+        classes_df
+        .join(instructor_3_df, on='class_id', how='left')
+        .join(instructor_4_df, on='class_id', how='left')
+        .with_columns([
+            pl.col('instructor_id_3').cast(pl.Utf8),
+            pl.col('instructor_id_4').cast(pl.Utf8),
+        ])
+    )
+    # Set the column order
+    result_df = result_df.select(
+        'class_id', 'class_number', 'course_id', 'instructor_id1', 'instructor_id2',
+          'instructor_id_3', 'instructor_id_4', 'location_id' ,'All Staff Names'
+        )
+
+    # Rename to final headers and write to classes file
+    result_df.columns = config.classes
+    result_df.write_csv(config.classes_file)
+
+
             
-#Data validation for all 6 oneroster files. Files are then written to a new folder for cleanliness
-def Fix_Headers(folder_path):
-    for filename in folder_path.glob('*.csv'):
-        dual_students = {'list of dual enrolled students'}
-        #confirms the headers for students file and deletes the old csv
-        if "students" in filename.name:
-            df = pd.read_csv(filename)
-            students_header = ['person_id', 'person_number', 'first_name', 'middle_name', 'last_name', 'grade_level', 'email_address', 'sis_username', 'password_policy', 'location_id', 'location_id_2']
-            df.columns = students_header
-            #Some students are dual enrolled at elem and IMS. Look for the duplicate - check which one is the IMS record and delete that row (for now)
-            #look by creating a list of index labels and dropping those. find all rows in the person_id column are in dual_students & have a location_id equal to the school they are at the least.
-            drop_list = df.index[ df['person_id'].isin(dual_students) & (df['location_id'] == 'LOCATION_ID_HERE') ]
-            df = df.drop(drop_list)
-            #Correct a student's name that is jacked up because of an accent above the e. Shout out computers.
-            try:
-                name_row = df.index[df['person_id']=='id']
-                df.loc[name_row, 'first_name'] = 'name'
-                name_row = df.index[df['person_id'] == 'id']
-                df.loc[name_row, 'last_name'] = 'name'
-            except Exception as e:
-                print(f'error: {e} could not process student ids')
-            df.to_csv('Path to folder for finished CSVs', index=False) #User Dependent
+# Iterate through files and trigger a different function for processing
+def file_processor():
+    for file in Path(config.source_folder).glob('*.csv'):
+        if "students" in file.name:
+            students_file(file)
+        elif "staff" in file.name:
+            staff_file(file)
+        elif "rosters" in file.name or "locations" in file.name or "courses" in file.name:
+            other_files(file)
+        elif "classes" in file.name:
+            class_file(file)
 
-        #confirms the headers for staff and creates the middle_name column and deletes the old csv
-        elif "staff" in filename.name:
-            df = pd.read_csv(filename)
-            position = df.columns.get_loc('first_name') + 1
-            df.insert(position, 'middle_name', pd.Series([None]*len(df))) #insert empty column after 'first_name' which replaces the middle initial one
-            #Gets list of all non empty middle initial value and then sets those values to the location_id at the same index
-            df.loc[df['middle_initial'].notna(), 'location_id 1'] = df['middle_initial']
-            df.drop('middle_initial', axis=1, inplace=True) #delete middle initial column
-            staff_header = ['person_id', 'person_number', 'first_name', 'middle_name', 'last_name', 'email_address', 'sis_username', 'location_id', 'location_id_2']
-            df.columns = staff_header
-
-            drop_list = df.index[df['location_id'].isna()]
-            df = df.drop(drop_list)
-            df['location_id'] = df['location_id'].astype(str)
-
-            df.to_csv('Path to folder for finished CSVs', index=False) #User Dependent
-
-        #confirms headers for rosters file and deletes the old csv
-        elif "rosters" in filename.name:
-            df = pd.read_csv(filename)
-            rosters_header = ['roster_id', 'class_id', 'student_id']
-            df.columns = rosters_header
-            df.to_csv('Path to folder for finished CSVs', index=False) #User Dependent
-
-        #confirms the headers for locations file and deletes the old csv
-        elif "locations" in filename.name:
-            df = pd.read_csv(filename)
-            locations_header = ['location_id', 'location_name']
-            df.columns = locations_header
-            df.to_csv('Path to folder for finished CSVs', index=False) #User Dependent
-
-        #confirms the headers for courses file and deletes the old csv
-        elif "courses" in filename.name:
-            df = pd.read_csv(filename)
-            courses_header = ['course_id', 'course_number', 'course_name', 'location_id']
-            df.columns = courses_header
-            df.to_csv('Path to folder for finished CSVs', index=False) #User Dependent
-        #confirms headers for classes file, performs a VLOOKUP with the para file and correctly inserts instructor_id_3 columns with the necessary values inserted. Deletes the old xlsx file.
-        elif "classes" in filename.name:
-            #load dataframes for classes.csv and instructor-3template.csv
-            instructor_path = folder_path / 'instructor3-template.csv'
-            instructor_df = pd.read_csv(instructor_path, usecols=[0,1])
-            classes_path = folder_path / 'classes.csv'
-            classes_df = pd.read_csv(classes_path)
-            classes_df['location_id'] = classes_df['location_id'].astype(str) #prevent location_ids becoming decimals
-            classes_df['instructor_id2'] = classes_df['instructor_id2'].astype('Int64') #prevent decimals, but in a way that does not try to cast empty cells
-
-            #insert the instructor_id_3 column
-            position = classes_df.columns.get_loc('instructor_id2') + 1
-            classes_df.insert(position, 'instructor_id_3',  pd.Series([None]*len(classes_df)))
-
-            #cast items as strings and create a dictionary from the instructor dataframe
-            instructor_df['class_id'] = instructor_df['class_id'].astype('Int64')
-            instructor_df['instructor_id_3'] = instructor_df['instructor_id_3'].astype('string')
-            instructor_dict = dict(instructor_df.values)
-            #Iterate through instructor_dict and match the class_id value in the classes.csv to find the row index then using that index write the instructor_id 
-            # in the id_3 column that is at that row_index (Basically a simple Vlookup using Pandas dataframes which is so cool)
-            for key, value in instructor_dict.items():
-                class_row = classes_df.index[classes_df['class_id'] == key]
-                classes_df.loc[class_row, 'instructor_id_3'] = value
-
-            #Rewrite the headers with correct items
-            classes_headers = ['class_id', 'class_number', 'course_id', 'instructor_id', 'instructor_id_2', 'instructor_id_3', 'location_id', 'All Staff Names']
-            classes_df.columns = classes_headers
-            classes_df.to_csv('Path to new folder for finished csvs', index=False)
             
-#send all the files to a zip folder
-def Zip_Files(folder_path, zip_file):
-    with zipfile.ZipFile(zip_file, 'w') as zipf:
-        for filename in folder_path.glob('*.csv'):
-            if "_" not in filename.name:
-                zipf.write(filename, arcname=filename.name)
-                print(f"Added '{filename}' to '{zip_file}'")
-    print(f"All ASM files have been added to '{zip_file}'")
+# send all the files to a zip folder (required for ASM uploads)
+def zip_files():
+    with zipfile.ZipFile(config.upload_zip, 'w') as zipf:
+        for file in Path(config.upload_folder).glob('*.csv'):
+            if "_" not in file.name:
+                zipf.write(file, arcname=file.name)
+                logger.info(f"Added '{file.name}' to '{config.upload_zip}'")
+    logger.info(f"All ASM files have been added to '{config.upload_zip}'")
             
-#clean up the folder after files have been uploaded
-def Delete_Files(folder_path):
-    for filename in folder_path.glob('*'):
-        if "_" not in filename.name:
-            try:
-                os.remove(filename)
-            except OSError as e:
-                print(f"Error deleting '{filename}': {e.strerror}")
-
-        
-#uploads the files to the ASM sftp server
-def Upload_File(server, port, username, password, local_path, remote_path):
-    transport = paramiko.Transport((server,port))
-    transport.connect(username=username, password=password)
-
-    sftp = paramiko.SFTPClient.from_transport(transport)
-
+# clean up the folder after files have been uploaded (no raise here, file deletion is only a cleanup thing not dire)
+def delete_files():
+    for file in Path(config.upload_folder).glob('*'):
+        try:
+            os.remove(file)
+            logger.info(f'deleted: {file.name}')
+        except Exception as e:
+            logger.error(f'Failed to delete file: {e}')
+                       
+# uploads the files to the ASM sftp server
+def upload_file():
+    transport = paramiko.Transport((config.server,22))
+    sftp = None
     try:
-        sftp.put(local_path, remote_path, confirm=False)
-        print(f"File {local_path} uploaded successfully to {remote_path}")
+        transport.connect(username=config.username, password=config.password)
+        sftp = paramiko.SFTPClient.from_transport(transport)
+        sftp.put(config.upload_zip, config.r_path, confirm=False)
+        logger.info(f"File {config.upload_zip} uploaded successfully to {config.r_path}")
     except Exception as e:
-        print(f"Error: {e}")
+        if sftp is not None:
+            sftp.close()
+        transport.close()
+        logger.critical(f"Error uploading zip file: {e}")
+        raise
     finally:
-        sftp.close()
+        if sftp is not None:
+            sftp.close()
         transport.close()
 
-#variables 
-#ASM server info is pulled from Settings page in ASM
-upload_server = "upload.appleschoolcontent.com"
-port = 22
-upload_username = "Username"
-upload_password = "Password"
-remote_path = "/dropbox/Archive.zip"
-
-#User Dependent Variables
-local_path = Path("Path To Final Zip File")
-folder_path = Path("Path To Folder For Placing Manipualted CSVs") 
-source_path = Path("Path where original files are grabbed from (QMlativ Exports)")
-
-#function calls
+# function calls
 if __name__ == '__main__':
-    Delete_Old_Files(source_path)
-    Fix_Headers(source_path)
-    Zip_Files(folder_path, local_path)
-    Upload_File(upload_server, port, upload_username, upload_password, local_path, remote_path)
-    time.sleep(5)
-    Delete_Files(folder_path)
-    print(f'\n\nFinished running ASMUpload.py at {datetime.now()}\n')
-    
+    delete_old_files()
+    file_processor()
+    zip_files()
+    upload_file()
+    delete_files()
